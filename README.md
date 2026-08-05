@@ -71,6 +71,22 @@ Dynamic Token Governor: Dynamically constrains max_tokens based on thermodynamic
 
 Prometheus Monitoring & Asynchronous Audit Logging: Provides a /metrics endpoint to export counters and gauges, alongside asynchronous telemetry logging for compliance auditing.
 
+## v4.0.2 — Production-ready fixes & enhancements
+- Added: global HTTP connection pooling (lifespan) with keep-alive and connection limits for high-concurrency workloads.
+- Added: Prometheus-compatible metrics support (prometheus_client integration if installed), with fallback text metrics rendering.
+- Fixed: memory & role sanitization bugs and syntax issues in MemoryLayer.
+- Fixed: accurate token counting support (optional tiktoken integration); added token budgeting and explicit context-exhausted error.
+- Added: TokenGovernor now rejects requests that would exceed model context with actionable hint (POST /v1/session/reset).
+- Added: line-buffered SSE streaming with pre-flush loop detection and atomic abort to avoid wasting tokens.
+- Added: jittered exponential backoff on upstream retries to avoid retry storms.
+- Added: session reset endpoint (POST /v1/session/reset) for client UX.
+- Added: readiness and liveness endpoints for K8s probes; readiness checks backend circuit state.
+- Added: metrics name mapping fix to ensure prometheus_client increments map correctly to internal counters.
+- Improved: thread-safe session manager and loop-detection hashing with asyncio locks.
+- Security & operational notes:
+  - Process-local RateLimiter & SessionManager are not suitable for multi-pod deployments—use Redis-based adapters for distributed deployments.
+  - Audit logs avoid PII by design; enable/disable debug logging via DEBUG_LOGGING env var.
+
 ## Quick Start
 
 ### 1. Installation

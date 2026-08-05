@@ -1,9 +1,17 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-Anti-Entropy Cognitive Middleware: Enterprise Ultimate Edition (v3.3.0)
+Anti-Entropy Cognitive Middleware: Enterprise Production Edition (v4.0.2)
 Author: Starsand
 Jurisdiction: HKSAR (Hong Kong Special Administrative Region)
 License: PolyForm Noncommercial License 1.0.0 (Non-Commercial Use Only)
+
+Multi-Pod Scaling Architecture Note (Redis Adapter Skeleton):
+To scale horizontally across multiple pods, replace process-local RateLimiter & SessionManager 
+with a Redis cluster backing store:
+    class RedisSessionManager:
+        async def get_or_create_session(self, session_id: str):
+            # Redis hash or JSON module lookup for session state & sliding window
+            pass
 """
 
 import os
@@ -11,29 +19,34 @@ import time
 import asyncio
 import logging
 import re
-import httpx
+import hashlib
+import json
+import random
 from typing import List, Dict, Set, Optional, Any
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
-import uvicorn
+import httpx
+
+# Optional: prometheus_client for standard metrics
+try:
+    from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    HAS_PROMETHEUS_LIB = True
+except ImportError:
+    HAS_PROMETHEUS_LIB = False
+
+# Optional: tiktoken import for precise token counting
+try:
+    import tiktoken
+    ENCODER = tiktoken.get_encoding("cl100k_base")
+except ImportError:
+    ENCODER = None
 
 # ==========================================
-# 0. System Logging & Environment Configuration
+# 0. Global Environment Variables & Configs
 # ==========================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s"
-)
-logger = logging.getLogger("CognitiveMiddleware")
-
-app = FastAPI(
-    title="Anti-Entropy Cognitive Middleware",
-    description="Enterprise-grade cognitive homeostatic proxy with multi-backend failover, rate limiting, adversarial guardrails, and telemetry auditing.",
-    version="3.3.0"
-)
-
-# Environment variables and configurations
+DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
 BACKEND_URLS = [
     url.strip() for url in os.getenv("LLM_BACKEND_URLS", "http://localhost:8080/v1/chat/completions").split(",")
     if url.strip()
@@ -44,6 +57,47 @@ MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", 64))
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", 4000))
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", 60.0))
 UPSTREAM_RETRIES = int(os.getenv("UPSTREAM_RETRIES", 2))
+MAX_MODEL_CONTEXT = int(os.getenv("MAX_MODEL_CONTEXT", 8192))
+REANCHOR_COOLDOWN_SECONDS = float(os.getenv("REANCHOR_COOLDOWN", 45.0))
+MAX_REANCHORS_PER_SESSION = int(os.getenv("MAX_REANCHORS_PER_SESSION", 3))
+
+# Connection Pool Settings
+HTTP_MAX_KEEPALIVE = int(os.getenv("HTTP_MAX_KEEPALIVE", 50))
+HTTP_MAX_CONNECTIONS = int(os.getenv("HTTP_MAX_CONNECTIONS", 200))
+
+# System Logging Setup
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG_LOGGING else logging.INFO,
+    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s"
+)
+logger = logging.getLogger("CognitiveMiddleware")
+
+# Global HTTP Client Instance
+http_client: Optional[httpx.AsyncClient] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    limits = httpx.Limits(
+        max_keepalive_connections=HTTP_MAX_KEEPALIVE,
+        max_connections=HTTP_MAX_CONNECTIONS
+    )
+    http_client = httpx.AsyncClient(
+        timeout=UPSTREAM_TIMEOUT,
+        limits=limits,
+        http2=True
+    )
+    logger.info(f"[Lifespan] Connection pool ready (KeepAlive: {HTTP_MAX_KEEPALIVE}, MaxConn: {HTTP_MAX_CONNECTIONS})")
+    yield
+    await http_client.aclose()
+    logger.info("[Lifespan] Global HTTP connection pool closed.")
+
+app = FastAPI(
+    title="Anti-Entropy Cognitive Middleware",
+    description="Enterprise-grade cognitive homeostatic proxy with robust metric name mapping, expanded K8s health checks, and session reset support.",
+    version="4.0.2",
+    lifespan=lifespan
+)
 
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -70,49 +124,103 @@ INJECTION_PATTERNS = [
 
 
 # ==========================================
-# 1. Prometheus Metrics Collector
+# 1. Prometheus Metrics Collector (Fixed Name Mapping)
 # ==========================================
-class MetricsCollector:
+class PrometheusMetrics:
     def __init__(self):
-        self.request_count = 0
-        self.entropy_violations = 0
-        self.circuit_trips = 0
-        self.rate_limited_count = 0
-        self.injection_blocked_count = 0
-        self.total_latency_ms = 0.0
+        self.metric_mapping = {
+            "requests": "requests",
+            "violations": "entropy_violations",
+            "circuit_trips": "circuit_trips",
+            "rate_limited": "rate_limited",
+            "injections": "injections",
+            "loops": "loops",
+            "tokens_sent": "tokens_sent",
+            "tokens_saved": "tokens_saved",
+            "reanchors": "reanchors"
+        }
+        if HAS_PROMETHEUS_LIB:
+            self.requests = Counter("anti_entropy_requests_total", "Total proxy requests handled.")
+            self.entropy_violations = Counter("anti_entropy_violations_total", "Total entropy degradation events.")
+            self.circuit_trips = Counter("anti_entropy_circuit_trips_total", "Total circuit breaker trips.")
+            self.rate_limited = Counter("anti_entropy_rate_limited_total", "Total rate limited requests.")
+            self.injections = Counter("anti_entropy_injection_blocked_total", "Total prompt injections blocked.")
+            self.loops = Counter("anti_entropy_loop_detected_total", "Total loop generations detected.")
+            self.tokens_sent = Counter("anti_entropy_tokens_sent_total", "Cumulative tokens sent.")
+            self.tokens_saved = Counter("anti_entropy_tokens_saved_total", "Cumulative tokens saved.")
+            self.reanchors = Counter("anti_entropy_reanchors_total", "Total re-anchoring events.")
+            self.latency_gauge = Gauge("anti_entropy_avg_latency_ms", "Latest proxy request latency in ms.")
+        else:
+            self._lock = asyncio.Lock()
+            self._counters = {
+                "requests": 0, "violations": 0, "circuit_trips": 0,
+                "rate_limited": 0, "injections": 0, "loops": 0,
+                "tokens_sent": 0, "tokens_saved": 0, "reanchors": 0
+            }
+            self.latest_latency = 0.0
 
-    def export_metrics(self) -> str:
-        avg_latency = (self.total_latency_ms / self.request_count) if self.request_count > 0 else 0.0
-        return f"""# HELP anti_entropy_requests_total Total proxy requests handled.
+    async def increment(self, metric_name: str, amount: float = 1.0):
+        target_attr = self.metric_mapping.get(metric_name, metric_name)
+        if HAS_PROMETHEUS_LIB:
+            gauge_or_counter = getattr(self, target_attr, None)
+            if gauge_or_counter and hasattr(gauge_or_counter, "inc"):
+                gauge_or_counter.inc(amount)
+        else:
+            async with self._lock:
+                if metric_name in self._counters:
+                    self._counters[metric_name] += amount
+
+    async def update_latency(self, latency_ms: float):
+        if HAS_PROMETHEUS_LIB:
+            self.latency_gauge.set(latency_ms)
+        else:
+            async with self._lock:
+                self.latest_latency = latency_ms
+
+    async def render(self) -> tuple[bytes, str]:
+        if HAS_PROMETHEUS_LIB:
+            return generate_latest(), CONTENT_TYPE_LATEST
+        else:
+            async with self._lock:
+                c = self._counters
+                output = f"""# HELP anti_entropy_requests_total Total proxy requests handled.
 # TYPE anti_entropy_requests_total counter
-anti_entropy_requests_total {self.request_count}
-
-# HELP anti_entropy_violations_total Total entropy degradation events intercepted.
+anti_entropy_requests_total {c['requests']}
+# HELP anti_entropy_violations_total Total entropy degradation events.
 # TYPE anti_entropy_violations_total counter
-anti_entropy_violations_total {self.entropy_violations}
-
-# HELP anti_entropy_circuit_trips_total Total upstream circuit breaker trips.
+anti_entropy_violations_total {c['violations']}
+# HELP anti_entropy_circuit_trips_total Total circuit breaker trips.
 # TYPE anti_entropy_circuit_trips_total counter
-anti_entropy_circuit_trips_total {self.circuit_trips}
-
-# HELP anti_entropy_rate_limited_total Total requests blocked by rate limiter.
+anti_entropy_circuit_trips_total {c['circuit_trips']}
+# HELP anti_entropy_rate_limited_total Total rate limited requests.
 # TYPE anti_entropy_rate_limited_total counter
-anti_entropy_rate_limited_total {self.rate_limited_count}
-
+anti_entropy_rate_limited_total {c['rate_limited']}
 # HELP anti_entropy_injection_blocked_total Total prompt injections blocked.
 # TYPE anti_entropy_injection_blocked_total counter
-anti_entropy_injection_blocked_total {self.injection_blocked_count}
-
-# HELP anti_entropy_avg_latency_ms Average upstream proxy latency in milliseconds.
+anti_entropy_injection_blocked_total {c['injections']}
+# HELP anti_entropy_loop_detected_total Total loop generations detected.
+# TYPE anti_entropy_loop_detected_total counter
+anti_entropy_loop_detected_total {c['loops']}
+# HELP anti_entropy_tokens_sent_total Cumulative tokens sent.
+# TYPE anti_entropy_tokens_sent_total counter
+anti_entropy_tokens_sent_total {c['tokens_sent']}
+# HELP anti_entropy_tokens_saved_total Cumulative tokens saved.
+# TYPE anti_entropy_tokens_saved_total counter
+anti_entropy_tokens_saved_total {c['tokens_saved']}
+# HELP anti_entropy_reanchors_total Total re-anchoring events.
+# TYPE anti_entropy_reanchors_total counter
+anti_entropy_reanchors_total {c['reanchors']}
+# HELP anti_entropy_avg_latency_ms Latest proxy request latency in ms.
 # TYPE anti_entropy_avg_latency_ms gauge
-anti_entropy_avg_latency_ms {avg_latency:.2f}
+anti_entropy_avg_latency_ms {self.latest_latency:.2f}
 """
+            return output.encode("utf-8"), "text/plain; version=0.0.4; charset=utf-8"
 
-metrics = MetricsCollector()
+metrics = PrometheusMetrics()
 
 
 # ==========================================
-# 2. Multi-Backend Failover & Circuit Breaker
+# 2. Circuit Breaker & Failover Router
 # ==========================================
 class MultiBackendCircuitBreaker:
     def __init__(self, urls: List[str], threshold: int = 4, timeout: float = 20.0):
@@ -142,20 +250,20 @@ class MultiBackendCircuitBreaker:
         self.failures[url] = 0
         self.states[url] = "CLOSED"
 
-    def record_failure(self, url: str):
+    async def record_failure_async(self, url: str):
         self.failures[url] += 1
         self.last_failure_times[url] = time.time()
         if self.failures[url] >= self.threshold:
             self.states[url] = "OPEN"
-            metrics.circuit_trips += 1
-            logger.error(f"[Circuit Breaker] Backend {url} marked OPEN due to repeated failures.")
+            await metrics.increment("circuit_trips")
+            logger.error(f"[Circuit Breaker] Backend {url} set to OPEN due to repeated failures.")
         self.current_index = (self.current_index + 1) % len(self.urls)
 
 backend_router = MultiBackendCircuitBreaker(BACKEND_URLS)
 
 
 # ==========================================
-# 3. Adversarial Guardrail & Injection Filter
+# 3. Guardrails & Token Utility
 # ==========================================
 class AdversarialGuardrail:
     @staticmethod
@@ -167,9 +275,20 @@ class AdversarialGuardrail:
                     return True
         return False
 
+def count_messages_tokens(messages: List[Dict[str, str]]) -> int:
+    serialized = "".join([f"<|im_start|>{m.get('role', 'user')}\n{m.get('content', '')}<|im_end|>\n" for m in messages])
+    if not serialized:
+        return 0
+    if ENCODER is not None:
+        try:
+            return len(ENCODER.encode(serialized))
+        except Exception:
+            pass
+    return max(1, int(len(serialized) / 2.5))
+
 
 # ==========================================
-# 4. Token Bucket Rate Limiter
+# 4. Rate Limiter (Process-Local Bucket)
 # ==========================================
 class RateLimiter:
     def __init__(self, capacity: float = 30.0, refill_rate: float = 10.0):
@@ -197,18 +316,14 @@ rate_limiter = RateLimiter()
 
 
 # ==========================================
-# 5. Adaptive Machine Learning PID Controller
+# 5. Adaptive PID Controller
 # ==========================================
 class AdaptivePIDController:
-    """
-    PID controller featuring anti-windup clamping and online reinforcement learning adaptation.
-    """
     def __init__(self, kp: float = 0.1, ki: float = 0.01, kd: float = 0.05, target_entropy: float = 2.5):
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.target_entropy = target_entropy
-        
         self.integral = 0.0
         self.last_error = 0.0
         self.last_time = time.time()
@@ -221,7 +336,6 @@ class AdaptivePIDController:
             dt = 1e-6
 
         error = self.target_entropy - current_metric
-        
         self.integral = max(-10.0, min(10.0, self.integral + (error * dt)))
         derivative = (error - self.last_error) / dt
 
@@ -242,37 +356,70 @@ class AdaptivePIDController:
 
 
 # ==========================================
-# 6. Memory Layer & Context Compression
+# 6. Memory Layer & Loop Guard
 # ==========================================
 class MemoryLayer:
     def __init__(self, max_history_window: int = 12):
         self.max_history_window = max_history_window
 
-    def process_and_compress(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        msgs = list(messages or [])
-        for m in msgs:
-            if isinstance(m.get("content"), str) and len(m["content"]) > MAX_MESSAGE_LENGTH:
-                m = m.copy()
-                m["content"] = m["content"][:MAX_MESSAGE_LENGTH]
-        if len(msgs) > self.max_history_window:
-            system_prompts = [m for m in msgs if m.get("role") == "system"]
-            recent_messages = msgs[-self.max_history_window:]
-            combined = system_prompts + [m for m in recent_messages if m not in system_prompts]
-            return combined
-        return msgs
+    def sanitize_and_validate_roles(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        valid_roles = {"system", "user", "assistant"}
+        sanitized = []
+        for m in messages:
+            role = m.get("role", "user")
+            if role not in valid_roles:
+                role = "user"
+            content = m.get("content", "")
+            if isinstance(content, str) and len(content) > MAX_MESSAGE_LENGTH:
+                content = content[:MAX_MESSAGE_LENGTH]
+            sanitized.append({"role": role, "content": content})
+        return sanitized
+
+    async def process_and_compress(self, messages: List[Dict[str, str]], session_system_prompt: Optional[str] = None) -> List[Dict[str, str]]:
+        msgs = self.sanitize_and_validate_roles(messages)
+        tokens_before = count_messages_tokens(msgs)
+
+        system_prompts = [m for m in msgs if m.get("role") == "system"]
+        canonical_prompt = session_system_prompt or (system_prompts[0]["content"] if system_prompts else "You are a precise, reliable AI assistant.")
+        
+        non_system_msgs = [m for m in msgs if m.get("role") != "system"]
+        if len(non_system_msgs) > self.max_history_window:
+            non_system_msgs = non_system_msgs[-self.max_history_window:]
+            
+        final_msgs = [{"role": "system", "content": canonical_prompt}] + non_system_msgs
+        tokens_after = count_messages_tokens(final_msgs)
+
+        saved = tokens_before - tokens_after
+        if saved > 0:
+            await metrics.increment("tokens_saved", saved)
+
+        return final_msgs
 
 
 # ==========================================
-# 7. LRU Session Manager with TTL & Thread Safety
+# 7. Session Manager (LRU + TTL)
 # ==========================================
 class SessionEntry:
     def __init__(self):
         self.pid = AdaptivePIDController()
         self.lock = asyncio.Lock()
         self.last_accessed = time.time()
+        self.system_prompt: Optional[str] = None
+        self.last_reanchor_time = 0.0
+        self.reanchor_count = 0
+        self.response_hashes: deque = deque(maxlen=5)
+
+    async def check_loop_async(self, assistant_text: str) -> bool:
+        async with self.lock:
+            if not assistant_text or len(assistant_text.strip()) < 10:
+                return False
+            h = hashlib.sha256(assistant_text.strip().encode("utf-8")).hexdigest()
+            if h in self.response_hashes:
+                return True
+            self.response_hashes.append(h)
+            return False
 
 class SessionManager:
-    """Manages isolated user sessions with thread safety and LRU capacity eviction."""
     def __init__(self, max_capacity: int = MAX_LRU_SESSIONS, ttl: int = SESSION_TTL_SECONDS):
         self.max_capacity = max_capacity
         self.ttl = ttl
@@ -282,7 +429,6 @@ class SessionManager:
 
     async def get_or_create_session(self, session_id: str) -> SessionEntry:
         now = time.time()
-        
         async with self._sessions_lock:
             expired = [sid for sid, entry in list(self.sessions.items()) if now - entry.last_accessed > self.ttl]
             for sid in expired:
@@ -305,7 +451,7 @@ session_manager = SessionManager(ttl=SESSION_TTL_SECONDS)
 
 
 # ==========================================
-# 8. Continuous Homeostatic Load & Drift Monitor
+# 8. Homeostatic Load Monitor
 # ==========================================
 class AnchorMonitor:
     @staticmethod
@@ -338,7 +484,6 @@ def calculate_ngram_repetition(text: str, n: int = 3) -> float:
     return 1.0 - (len(set(ngrams)) / len(ngrams))
 
 def evaluate_continuous_homeostatic_load(messages: List[Dict[str, str]]) -> float:
-    """Evaluates continuous homeostatic load for smooth PID error modulation."""
     if not messages:
         return 2.5
     last_content = messages[-1].get("content", "")
@@ -351,22 +496,37 @@ def evaluate_continuous_homeostatic_load(messages: List[Dict[str, str]]) -> floa
 
 
 # ==========================================
-# 9. Dynamic Token Governor & Audit Logger
+# 9. Token Governor & Audit Logger
 # ==========================================
 class TokenGovernor:
     @staticmethod
-    def govern(body: dict, homeo_load: float):
-        """Dynamically adjusts max_tokens based on thermodynamic load."""
+    def govern(body: dict, homeo_load: float, prompt_tokens: int) -> Optional[JSONResponse]:
+        safety_margin = 64
+        remaining_budget = MAX_MODEL_CONTEXT - prompt_tokens - safety_margin
+        
+        if remaining_budget <= 0:
+            return JSONResponse({
+                "error": {
+                    "message": "Context window exhausted. Prompt size exceeds total available context.",
+                    "hint": "Please call POST /v1/session/reset to clear history, trim old messages, or execute context summarization.",
+                    "type": "context_exhausted_error",
+                    "code": 400
+                }
+            }, status_code=400)
+
+        current_max = body.get("max_tokens", 2048)
+        body["max_tokens"] = min(current_max, remaining_budget)
+
         if homeo_load < 1.2:
-            body["max_tokens"] = min(body.get("max_tokens", 2048), 256)
+            body["max_tokens"] = min(body["max_tokens"], 256)
         elif homeo_load > 3.5:
             if "max_tokens" not in body:
-                body["max_tokens"] = 2048
+                body["max_tokens"] = min(2048, remaining_budget)
+        return None
 
 class AuditLogger:
     @staticmethod
     async def log_trajectory(sid: str, backend: str, load: float, temp_delta: float, status_code: int):
-        """Asynchronously records structured telemetry for auditing and compliance."""
         record = {
             "timestamp": time.time(),
             "session_id": sid,
@@ -379,64 +539,100 @@ class AuditLogger:
 
 
 # ==========================================
-# 10. FastAPI Endpoints & Core Proxy Logic
+# 10. K8s Health, Readiness & Metrics Endpoints
 # ==========================================
 @app.get("/health", tags=["Monitoring"])
-async def health_check():
+@app.get("/live", tags=["Monitoring"])
+async def liveness_check():
+    return {"status": "alive", "version": "4.0.2"}
+
+@app.get("/ready", tags=["Monitoring"])
+async def readiness_check():
+    if http_client is None:
+        return JSONResponse({"status": "not_ready", "reason": "http_client_uninitialized"}, status_code=503)
+    
+    # Check if all backend circuit breakers are tripped (OPEN)
+    all_open = all(state == "OPEN" for state in backend_router.states.values())
+    if all_open and backend_router.urls:
+        return JSONResponse({
+            "status": "not_ready", 
+            "reason": "all_backends_circuit_open"
+        }, status_code=503)
+
+    active_backend = backend_router.get_active_backend()
     return {
-        "status": "enterprise_ultimate_healthy",
-        "version": "3.3.0",
-        "active_sessions": len(session_manager.sessions),
-        "active_backend": backend_router.get_active_backend()
+        "status": "ready",
+        "active_backend": active_backend,
+        "active_sessions": len(session_manager.sessions)
     }
 
 @app.get("/metrics", tags=["Monitoring"])
 async def metrics_endpoint():
-    return PlainTextResponse(metrics.export_metrics())
+    content_bytes, content_type = await metrics.render()
+    return PlainTextResponse(content_bytes.decode("utf-8"), media_type=content_type)
 
 
-def _sanitize_and_limit_messages(raw_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    msgs = list(raw_messages or [])
-    if len(msgs) > MAX_MESSAGES:
-        logger.warning(f"Trimming messages from {len(msgs)} to MAX_MESSAGES={MAX_MESSAGES}")
-        msgs = msgs[-MAX_MESSAGES:]
-    sanitized = []
-    for m in msgs:
-        mm = dict(m)
-        if isinstance(mm.get("content"), str) and len(mm["content"]) > MAX_MESSAGE_LENGTH:
-            mm["content"] = mm["content"][:MAX_MESSAGE_LENGTH]
-        sanitized.append(mm)
-    return sanitized
+# ==========================================
+# 11. Session Management Endpoints (UX)
+# ==========================================
+@app.post("/v1/session/reset", tags=["Session"])
+async def reset_session(request: Request):
+    client_ip = request.client.host if request.client else "default"
+    session_id = request.headers.get("x-session-id", client_ip)
+    
+    async with session_manager._sessions_lock:
+        if session_id in session_manager.sessions:
+            session_manager.sessions.pop(session_id, None)
+            
+    logger.info(f"[Session Reset] Session history manually cleared for session_id: {session_id}")
+    return {
+        "status": "success",
+        "message": f"Session {session_id} history has been successfully reset.",
+        "session_id": session_id
+    }
 
 
-async def _send_with_retries(client: httpx.AsyncClient, req: httpx.Request, backend_url: str) -> httpx.Response:
+# Retries with Jittered Exponential Backoff
+async def _send_with_retries(req: httpx.Request, backend_url: str) -> httpx.Response:
+    global http_client
+    if http_client is None:
+        raise RuntimeError("HTTP connection pool not initialized.")
+
     last_exc = None
     for attempt in range(1, UPSTREAM_RETRIES + 2):
         try:
-            response = await client.send(req, stream=True)
+            response = await http_client.send(req, stream=True)
             if response.status_code >= 500 and attempt <= UPSTREAM_RETRIES:
                 await response.aclose()
-                backoff = 0.5 * (2 ** (attempt - 1))
-                logger.warning(f"Upstream 5xx at {backend_url}, retrying in {backoff}s (attempt {attempt})")
-                await asyncio.sleep(backoff)
+                base_backoff = 0.5 * (2 ** (attempt - 1))
+                jitter = random.uniform(0.05, 0.25)
+                total_backoff = base_backoff + jitter
+                logger.warning(f"Upstream 5xx at {backend_url}, retrying in {total_backoff:.2f}s (attempt {attempt})")
+                await asyncio.sleep(total_backoff)
                 continue
             return response
         except (httpx.RequestError, httpx.TransportError) as e:
             last_exc = e
-            backoff = 0.5 * (2 ** (attempt - 1))
-            logger.warning(f"Upstream request error at {backend_url}: {e}; retrying in {backoff}s (attempt {attempt})")
-            await asyncio.sleep(backoff)
+            base_backoff = 0.5 * (2 ** (attempt - 1))
+            jitter = random.uniform(0.05, 0.25)
+            total_backoff = base_backoff + jitter
+            logger.warning(f"Upstream error at {backend_url}: {e}; retrying in {total_backoff:.2f}s (attempt {attempt})")
+            await asyncio.sleep(total_backoff)
             continue
     raise last_exc if last_exc is not None else RuntimeError("Upstream retries exhausted")
 
 
+# ==========================================
+# 12. Core Proxy Handler
+# ==========================================
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(request: Request):
+    await metrics.increment("requests")
     client_ip = request.client.host if request.client else "default"
     session_id = request.headers.get("x-session-id", client_ip)
 
     if not rate_limiter.allow(session_id):
-        metrics.rate_limited_count += 1
+        await metrics.increment("rate_limited")
         return JSONResponse({
             "error": {
                 "message": "Rate limit exceeded. Please slow down your request frequency.",
@@ -453,7 +649,7 @@ async def proxy_chat_completions(request: Request):
     raw_messages = body.get("messages", [])
 
     if AdversarialGuardrail.inspect(raw_messages):
-        metrics.injection_blocked_count += 1
+        await metrics.increment("injections")
         return JSONResponse({
             "error": {
                 "message": "Request intercepted by adversarial guardrail policy.",
@@ -464,17 +660,46 @@ async def proxy_chat_completions(request: Request):
 
     session_entry = await session_manager.get_or_create_session(session_id)
 
-    raw_messages = _sanitize_and_limit_messages(raw_messages)
-    optimized_messages = session_manager.memory_layer.process_and_compress(raw_messages)
-    body["messages"] = optimized_messages
-
-    metrics.request_count += 1
-    start_time = time.time()
-
     async with session_entry.lock:
+        if not session_entry.system_prompt:
+            for m in raw_messages:
+                if m.get("role") == "system":
+                    session_entry.system_prompt = m.get("content")
+                    break
+
+        optimized_messages = await session_manager.memory_layer.process_and_compress(raw_messages, session_entry.system_prompt)
+
         homeo_load = evaluate_continuous_homeostatic_load(optimized_messages)
         if homeo_load < 1.5:
-            metrics.entropy_violations += 1
+            await metrics.increment("violations")
+
+        now = time.time()
+        if (
+            homeo_load < 1.8 
+            and session_entry.reanchor_count < MAX_REANCHORS_PER_SESSION 
+            and (now - session_entry.last_reanchor_time > REANCHOR_COOLDOWN_SECONDS)
+        ):
+            reanchor_msg = {
+                "role": "system",
+                "content": "System Reminder: Maintain strict task alignment, logical rigor, and avoid circular or repetitive phrasing."
+            }
+            optimized_messages.insert(1, reanchor_msg)
+            session_entry.last_reanchor_time = now
+            session_entry.reanchor_count += 1
+            await metrics.increment("reanchors")
+            logger.info(f"[Re-anchor] Injected system prompt ({session_entry.reanchor_count}/{MAX_REANCHORS_PER_SESSION}) for session {session_id} (Load: {homeo_load:.2f})")
+        elif session_entry.reanchor_count >= MAX_REANCHORS_PER_SESSION and homeo_load < 1.8:
+            logger.warning(f"[Re-anchor Cap Reached] Session {session_id} hit reanchor limit ({MAX_REANCHORS_PER_SESSION}). Skipping.")
+
+        body["messages"] = optimized_messages
+
+        prompt_tokens = count_messages_tokens(optimized_messages)
+        await metrics.increment("tokens_sent", prompt_tokens)
+
+        governor_error = TokenGovernor.govern(body, homeo_load, prompt_tokens)
+        if governor_error is not None:
+            await metrics.increment("rate_limited")
+            return governor_error
 
         delta_t = session_entry.pid.compute(homeo_load)
         base_temp = body.get("temperature", 0.7)
@@ -485,11 +710,11 @@ async def proxy_chat_completions(request: Request):
             base_topp = body.get("top_p", 1.0)
             body["top_p"] = max(0.1, min(1.0, base_topp - (delta_t * 0.2)))
 
-        TokenGovernor.govern(body, homeo_load)
-        session_entry.last_accessed = time.time()
+        session_entry.last_accessed = now
 
+    start_time = time.time()
     active_url = backend_router.get_active_backend()
-    logger.info(f"Session: {session_id} | Backend: {active_url} | Load: {homeo_load:.2f} | Temp: {base_temp} -> {adjusted_temp:.4f}")
+    logger.info(f"Session: {session_id} | Backend: {active_url} | Load: {homeo_load:.2f} | Tokens: {prompt_tokens} | Temp: {base_temp} -> {adjusted_temp:.4f}")
 
     forward_headers = {}
     for k, v in request.headers.items():
@@ -497,34 +722,112 @@ async def proxy_chat_completions(request: Request):
         if kl in FORWARD_HEADER_WHITELIST and kl not in HOP_BY_HOP_HEADERS:
             forward_headers[k] = v
 
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-        req = client.build_request("POST", active_url, json=body, headers=forward_headers)
-        try:
-            response = await _send_with_retries(client, req, active_url)
-            backend_router.record_success(active_url)
-        except Exception as e:
-            backend_router.record_failure(active_url)
-            logger.error(f"Upstream unreachable at {active_url}: {e}")
-            asyncio.create_task(AuditLogger.log_trajectory(session_id, active_url, homeo_load, delta_t, 503))
-            return JSONResponse({
-                "error": {
-                    "message": "Middleware Error: Active and fallback inference backends unreachable.",
-                    "type": "server_error",
-                    "code": 503
-                }
-            }, status_code=503)
+    if http_client is None:
+        return JSONResponse({"error": {"message": "Middleware not ready.", "code": 503}}, status_code=503)
+
+    req = http_client.build_request("POST", active_url, json=body, headers=forward_headers)
+    try:
+        response = await _send_with_retries(req, active_url)
+        backend_router.record_success(active_url)
+    except Exception as e:
+        await backend_router.record_failure_async(active_url)
+        logger.error(f"Upstream unreachable at {active_url}: {e}")
+        asyncio.create_task(AuditLogger.log_trajectory(session_id, active_url, homeo_load, delta_t, 503))
+        return JSONResponse({
+            "error": {
+                "message": "Middleware Error: Active and fallback inference backends unreachable.",
+                "type": "server_error",
+                "code": 503
+            }
+        }, status_code=503)
 
     elapsed_ms = (time.time() - start_time) * 1000.0
-    metrics.total_latency_ms += elapsed_ms
-
+    await metrics.update_latency(elapsed_ms)
     asyncio.create_task(AuditLogger.log_trajectory(session_id, active_url, homeo_load, delta_t, response.status_code))
 
-    async def stream_and_close():
+    content_type = response.headers.get("content-type", "")
+
+    if "application/json" in content_type:
         try:
-            async for chunk in response.aiter_bytes():
-                yield chunk
+            resp_body = await response.aread()
+            await response.aclose()
+            text_body = resp_body.decode("utf-8", errors="ignore")
+            data = json.loads(text_body)
+            
+            assistant_text = ""
+            choices = data.get("choices", [])
+            if choices and isinstance(choices, list) and len(choices) > 0:
+                first_choice = choices[0]
+                if isinstance(first_choice, dict):
+                    if "message" in first_choice and isinstance(first_choice["message"], dict):
+                        assistant_text = first_choice["message"].get("content", "")
+                    elif "text" in first_choice:
+                        assistant_text = first_choice.get("text", "")
+            
+            if assistant_text:
+                is_dup = await session_entry.check_loop_async(assistant_text)
+                if is_dup or calculate_ngram_repetition(assistant_text, n=3) > 0.6:
+                    await metrics.increment("loops")
+                    logger.warning(f"[Loop Detector] Detected repetition in non-streaming response for session {session_id}")
+            
+            resp_headers = {k: v for k, v in response.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+            return JSONResponse(data, status_code=response.status_code, headers=resp_headers)
+        except Exception as ex:
+            logger.error(f"[JSON Parse Error] {ex}")
+            return JSONResponse({
+                "error": {
+                    "message": "Middleware Error: Failed to parse upstream JSON payload structure.",
+                    "type": "upstream_parse_error",
+                    "code": 502
+                }
+            }, status_code=502)
+
+    async def stream_and_close():
+        assistant_full_text = ""
+        loop_aborted = False
+        try:
+            async for line in response.aiter_lines():
+                line_str = line if isinstance(line, str) else line.decode("utf-8", errors="ignore")
+                
+                if line_str.startswith("data: ") and line_str != "data: [DONE]":
+                    try:
+                        data_json = json.loads(line_str[6:])
+                        choices = data_json.get("choices", [])
+                        delta = ""
+                        if choices and isinstance(choices, list):
+                            fc = choices[0]
+                            if isinstance(fc, dict):
+                                if "delta" in fc and isinstance(fc["delta"], dict):
+                                    delta = fc["delta"].get("content", "")
+                                elif "text" in fc:
+                                    delta = fc.get("text", "")
+                        
+                        if delta:
+                            assistant_full_text += delta
+                            if len(assistant_full_text) > 100 and calculate_ngram_repetition(assistant_full_text, n=3) > 0.6:
+                                loop_aborted = True
+                                break
+                    except Exception:
+                        pass
+                
+                if loop_aborted:
+                    break
+                
+                yield (line_str + "\n").encode("utf-8")
+
+            if loop_aborted:
+                await metrics.increment("loops")
+                logger.warning(f"[Loop Detector] SSE generation aborted for session {session_id}")
+                yield b'data: {"error": {"message": "Generation aborted by anti-entropy loop protection.", "code": 500}}\n\n'
+                yield b'data: [DONE]\n\n'
+        except Exception as e:
+            logger.error(f"[Stream Error] {e}")
         finally:
             await response.aclose()
+            if assistant_full_text and not loop_aborted:
+                is_dup = await session_entry.check_loop_async(assistant_full_text)
+                if is_dup or calculate_ngram_repetition(assistant_full_text, n=3) > 0.55:
+                    await metrics.increment("loops")
 
     resp_headers = {k: v for k, v in response.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
 
@@ -535,5 +838,6 @@ async def proxy_chat_completions(request: Request):
     )
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
