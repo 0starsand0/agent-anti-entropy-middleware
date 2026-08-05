@@ -1,0 +1,76 @@
+# Anti-Entropy Core Middleware
+
+> Breaking the "Entropy Wall" in Long-Horizon AI Agents via PID-Driven Dynamic Temperature Modulation and Mathematical Homeostasis.
+
+---
+
+## Overview
+
+In long-horizon agent execution (such as multi-step reasoning loops on orchestration platforms like Dify or Letta), agents frequently suffer from degradation phenomena: semantic repetition, entropy collapse, or chaotic noise injection. 
+
+**Anti-Entropy Core Middleware** is a lightweight proxy layer positioned between orchestration platforms and local inference engines (e.g., `llama.cpp`). By treating LLM generation as a thermodynamic and dynamical system, it actively monitors token entropy, detects semantic loops, and applies a closed-loop **PID controller** to dynamically modulate generation temperature in real-time.
+
+---
+
+## Theoretical Foundation
+
+### 1. The Information Theory Perspective Shannon Entropy Collapse and Explosion
+Model outputs represent probability distributions P w i given C generated via Softmax.
+Instantaneous information entropy is defined as:
+S token C equals negative sum from i equals 1 to V of P w i given C log base 2 of P w i given C
+
+* **Entropy Collapse S goes to 0:** Accumulated noise pushes the distribution toward repetitive paths P w k goes to 1, trapping the agent in a loop.
+* **Entropy Explosion S goes to max:** Over-polluted memory flattens the distribution, turning output into random nonsense.
+
+### 2. Digital Mapping of the Second Law of Thermodynamics
+An LLM reasoning trace maps to a Markov chain. Without Negative Entropy Flow homeostatic feedback, system entropy strictly increases over time:
+Delta S system greater than or equal to 0
+
+### 3. Dynamical Systems Local Attractor Basins
+In high dimensional phase space, context degradation shapes the landscape into deep local attractor basins where hidden state vectors h t collapse:
+limit as t goes to infinity of the norm of h t minus h t minus k equals 0
+
+---
+
+## Core Mathematical Pillars
+
+1. **Real Time Token Entropy Monitoring S token:**
+   S token C equals negative sum from i equals 1 to V of P w i given C log base 2 of P w i given C
+
+2. **Hybrid Loop Detection D hybrid:**
+   D hybrid t equals w 1 R ngram t plus w 2 times 1 minus 1 over k sum from j equals 1 to k of cosine of h t comma h t minus j
+
+3. **PID Driven Dynamic Temperature Modulation:**
+   T t equals T 0 plus K p e t plus K i integral from 0 to t of e tau d tau plus K d de t dt
+   
+   Where the error term is:
+   e t equals Phi target minus E homeo t
+
+---
+
+## Quick Start
+
+### 1. Installation
+Clone the repository and install dependencies:
+```bash
+git clone https://github.com/0starsand0/agent-anti-entropy-middleware.git
+cd agent-anti-entropy-middleware
+pip install fastapi uvicorn httpx
+
+### 2. Run the Middleware PoC
+python anti_entropy_poc.py
+```
+
+The proxy server will launch at http://localhost:8000, intercepting requests, evaluating homeostatic loads, and forwarding adjusted parameters to your backend inference engine (http://localhost:8080).
+
+## Author & Jurisdiction
+
+* **Author:** Starsand
+* **Jurisdiction:** HKSAR (Hong Kong Special Administrative Region)
+* **Legal & Ethical Stance:** Operating under the legal framework of the HKSAR, committed to the pursuit of justice, the protection of intellectual property rights, and the integrity of open-source development.
+
+---
+
+## License
+
+This software is protected under the **PolyForm Noncommercial License 1.0.0**[cite: 1]. You may use, modify, and distribute it for non-commercial purposes only[cite: 1]. Commercial use, embedding in commercial products, or operating as a commercial service is strictly prohibited without prior written authorization from the author[cite: 1].
