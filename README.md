@@ -1,15 +1,12 @@
-# Anti-Entropy Core Middleware
+# Anti Entropy Cognitive Middleware v2 0 0
 
-> Breaking the "Entropy Wall" in Long-Horizon AI Agents via PID-Driven Dynamic Temperature Modulation and Mathematical Homeostasis.
+Breaking the Entropy Wall in Long Horizon AI Agents via Adaptive ML PID Control Dynamic Temperature Modulation and Episodic Memory Layers
 
----
+# Overview
 
-## Overview
+In long horizon agent execution such as multi step reasoning loops on orchestration platforms like Dify or Letta agents frequently suffer from degradation phenomena semantic repetition entropy collapse chaotic noise injection and context rot
 
-In long-horizon agent execution (such as multi-step reasoning loops on orchestration platforms like Dify or Letta), agents frequently suffer from degradation phenomena: semantic repetition, entropy collapse, or chaotic noise injection. 
-
-**Anti-Entropy Core Middleware** is a lightweight proxy layer positioned between orchestration platforms and local inference engines (e.g., `llama.cpp`). By treating LLM generation as a thermodynamic and dynamical system, it actively monitors token entropy, detects semantic loops, and applies a closed-loop **PID controller** to dynamically modulate generation temperature in real-time.
-
+Anti Entropy Cognitive Middleware is an enterprise grade lightweight proxy layer positioned between orchestration platforms and local inference engines like llama cpp Treating LLM generation as a thermodynamic and dynamical system it actively monitors token entropy detects semantic loops tracks contextual drift compresses episodic memory and applies an Adaptive ML PID controller to dynamically modulate generation temperature in real time
 ---
 
 ## Theoretical Foundation
@@ -47,6 +44,14 @@ limit as t goes to infinity of the norm of h t minus h t minus k equals 0
    e t equals Phi target minus E homeo t
 
 ---
+# Changelog
+
+## Version 2 0 0
+Added Adaptive ML PID Controller with online self tuning reinforcement heuristic
+Introduced Episodic Memory Layer for context compression and context rot prevention
+Implemented Auto Anchor and Drift Monitor Engine using Jaccard distance heuristics
+Added Multi Session Isolation and TTL Manager for memory leak protection under high concurrency
+Enhanced system observability and robust upstream error handling
 
 ## Quick Start
 
