@@ -1,12 +1,40 @@
-# Anti Entropy Cognitive Middleware v2 0 0
+# Anti-Entropy Cognitive Middleware (AECM) v4.0.2: Enterprise Production Edition
 
-Breaking the Entropy Wall in Long Horizon AI Agents via Adaptive ML PID Control Dynamic Temperature Modulation and Episodic Memory Layers
+Breaking the Entropy Wall in Long-Horizon AI Agents via Adaptive ML PID Control, Dynamic Temperature Modulation, and Episodic Memory Layers
 
 # Overview
 
-In long horizon agent execution such as multi step reasoning loops on orchestration platforms like Dify or Letta agents frequently suffer from degradation phenomena semantic repetition entropy collapse chaotic noise injection and context rot
+In long-horizon agent execution—such as multi-step reasoning loops on orchestration platforms like Dify or Letta—agents frequently suffer from severe degradation phenomena: semantic repetition, entropy collapse, chaotic noise injection, and context rot.
 
-Anti Entropy Cognitive Middleware is an enterprise grade lightweight proxy layer positioned between orchestration platforms and local inference engines like llama cpp Treating LLM generation as a thermodynamic and dynamical system it actively monitors token entropy detects semantic loops tracks contextual drift compresses episodic memory and applies an Adaptive ML PID controller to dynamically modulate generation temperature in real time
+Anti-Entropy Cognitive Middleware (AECM) is an enterprise-grade, lightweight proxy layer positioned between orchestration platforms and local inference engines (like llama.cpp / vLLM). Treating LLM generation as a thermodynamic and dynamical system, it actively monitors token entropy, detects semantic loops, tracks contextual drift, compresses episodic memory, and applies an Adaptive ML PID controller to dynamically modulate generation temperature and top_p in real time, fundamentally eliminating hallucinations and looping behaviors.
+
+With the release of v4.0.2 Enterprise Golden Edition, the system completes a comprehensive production-grade hardening across observability, high availability, Kubernetes native probes, and error recovery UX.
+
+v4.0.2 Core Architecture & Features
+1. Adaptive ML PID Control & Dynamic Temperature Modulation
+Thermodynamic Load Calculation: Real-time analysis of conversation n-gram repetition rates and anchor drift rates to compute the current system's thermodynamic homeostatic load.
+
+Dynamic Parameter Adjustment: When anomalies are detected, the PID controller automatically calculates and fine-tunes temperature and top_p. It gently warms up when rigidity is detected and cools down during chaotic drift, ensuring reasoning stays in the golden balance zone.
+
+2. Zero-Latency SSE Stream Loop Defense & Auto Re-anchoring Engine
+Asynchronous Streaming Firewall: Built-in FastAPI and async-pipeline stream parsing mechanism to instantly capture repetitive phrases within SSE chunks.
+
+Smart Re-anchoring: Upon detecting early signs of continuous loops or entropy collapse, it safely injects system-level prompts into the conversation sequence, forcing model convergence without breaking JSON structure or stream integrity.
+
+3. Episodic Memory Layer & Token Governor
+Dual Memory Firewall: Manages session lifecycles via LRU and TTL mechanisms, automatically filtering and standardizing message roles and lengths to prevent context overflow.
+
+Token Budget Protection: If the model context is exhausted, the Token Governor actively intercepts and returns a 400 error equipped with remediation hints, while introducing the dedicated POST /v1/session/reset endpoint to let clients clear current session history instantly for rapid recovery.
+
+4. Enterprise Observability & Smart K8s Health Probes
+Prometheus Alignment: Native prometheus_client support with strict attribute name mapping, ensuring all counters (such as violations, loops, injections) render accurately in monitoring dashboards.
+
+Smart Readiness Probe: The /ready probe not only checks connection pools but also inspects all upstream LLM backends to verify if they have all tripped into OPEN circuit breaker states. If entirely unhealthy, it returns 503, preventing Kubernetes from routing traffic to unresponsive pods.
+
+Robust Fault Tolerance: Supports asynchronous retries with jittered exponential backoff and multi-backend failover routing.
+
+5. Multi-Pod Horizontal Scaling Blueprint (Redis Adapter Skeleton)
+Pre-engineered with a Redis cluster-backed architecture blueprint for RateLimiter and SessionManager, enabling seamless scaling across multi-pod clusters for large-scale enterprise production requirements.
 ---
 
 ## Theoretical Foundation
