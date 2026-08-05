@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """
-Anti-Entropy Cognitive Middleware with Adaptive ML PID & Memory Layers (v2.0.0)
+Anti-Entropy Cognitive Middleware with Production Hardening (v2.3.0)
 Author: Starsand
 Jurisdiction: HKSAR (Hong Kong Special Administrative Region)
 License: PolyForm Noncommercial License 1.0.0 (Non-Commercial Use Only)
-
-This software is licensed under the PolyForm Noncommercial License 1.0.0.
-You may use, modify, and distribute this software for non-commercial purposes only.
-Commercial use, embedding in commercial products, or operating as a commercial 
-service is strictly prohibited without prior written authorization from the author.
 """
 
 import os
 import time
+import asyncio
 import logging
 import httpx
 from typing import List, Dict, Any
@@ -21,7 +17,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 
 # ==========================================
-# 0. System Logging & Environment Configuration
+# 0. 系統日誌與環境配置
 # ==========================================
 logging.basicConfig(
     level=logging.INFO,
@@ -31,21 +27,39 @@ logger = logging.getLogger("CognitiveMiddleware")
 
 app = FastAPI(
     title="Anti-Entropy Cognitive Middleware",
-    description="Production-ready cognitive homeostatic proxy with adaptive ML PID and memory layers.",
-    version="2.0.0"
+    description="Production-hardened cognitive homeostatic proxy with async locks, continuous metrics, and safe streaming.",
+    version="2.3.0"
 )
 
 BACKEND_URL = os.getenv("LLM_BACKEND_URL", "http://localhost:8080/v1/chat/completions")
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", 3600))
+MAX_MESSAGES = int(os.getenv("MAX_MESSAGES", 64))
+MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", 4000))
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", 60.0))
+UPSTREAM_RETRIES = int(os.getenv("UPSTREAM_RETRIES", 2))
 
+# Hop-by-hop headers that must not be forwarded
+HOP_BY_HOP_HEADERS = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length"
+}
+
+# Explicit whitelist of headers we allow to forward to upstream
+FORWARD_HEADER_WHITELIST = {
+    "accept",
+    "accept-encoding",
+    "content-type",
+    "user-agent",
+    "x-request-id",
+    "x-session-id",
+}
 
 # ==========================================
-# 1. Adaptive ML PID Controller (Self-Tuning)
+# 1. 強健的機器學習自適應 PID 控制器
 # ==========================================
 class AdaptivePIDController:
     """
-    PID Controller with online reinforcement adaptation for gains (Kp, Ki, Kd).
-    Dynamically adjusts parameters based on error gradients during runtime.
+    具備積分防飽和（Anti-Windup）與線上增強學習適應機制的 PID 控制器。
     """
     def __init__(self, kp: float = 0.1, ki: float = 0.01, kd: float = 0.05, target_entropy: float = 2.5):
         self.kp = kp
@@ -56,7 +70,6 @@ class AdaptivePIDController:
         self.integral = 0.0
         self.last_error = 0.0
         self.last_time = time.time()
-        self.last_accessed = time.time()
         self.success_streak = 0
 
     def compute(self, current_metric: float) -> float:
@@ -66,17 +79,18 @@ class AdaptivePIDController:
             dt = 1e-6
 
         error = self.target_entropy - current_metric
-        self.integral += error * dt
+        
+        # 積分防飽和夾具 (Anti-Windup Clamping)
+        self.integral = max(-10.0, min(10.0, self.integral + (error * dt)))
         derivative = (error - self.last_error) / dt
 
         output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
         
-        # Online Machine Learning Adaptation (Active Self-Tuning Heuristic)
+        # 線上自適應機器學習調校
         if abs(error) < abs(self.last_error):
             self.success_streak += 1
             if self.success_streak > 3:
                 self.kp = max(0.05, min(0.3, self.kp * 1.02))
-                logger.debug(f"[Adaptive ML] Convergence steady. Tuned Kp up to: {self.kp:.4f}")
                 self.success_streak = 0
         else:
             self.kp = max(0.05, self.kp * 0.95)
@@ -84,70 +98,73 @@ class AdaptivePIDController:
 
         self.last_error = error
         self.last_time = now
-        self.last_accessed = now
         return output
 
+
 # ==========================================
-# 2. Episodic Memory Layer & State Manager
+# 2. 對話記憶與上下文壓縮層
 # ==========================================
 class MemoryLayer:
-    """
-    Manages session context summarization and episodic state to prevent context rot.
-    """
     def __init__(self, max_history_window: int = 12):
         self.max_history_window = max_history_window
-        self.memory_store: Dict[str, Dict[str, Any]] = {}
 
-    def process_and_compress(self, session_id: str, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        if session_id not in self.memory_store:
-            self.memory_store[session_id] = {"summary": "", "history": []}
-        
-        session_mem = self.memory_store[session_id]
-        session_mem["history"] = messages
-        
-        if len(messages) > self.max_history_window:
-            system_prompts = [m for m in messages if m.get("role") == "system"]
-            recent_messages = messages[-self.max_history_window:]
-            
-            compressed_messages = system_prompts + recent_messages
-            logger.info(f"[Memory Layer] Session {session_id}: Compressed history from {len(messages)} down to {len(compressed_messages)} messages.")
-            return compressed_messages
-            
-        return messages
+    def process_and_compress(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        # enforce limits and avoid returning references to caller's list
+        msgs = list(messages or [])
+        # trim individual message content length
+        for m in msgs:
+            if isinstance(m.get("content"), str) and len(m["content"]) > MAX_MESSAGE_LENGTH:
+                m = m.copy()
+                m["content"] = m["content"][:MAX_MESSAGE_LENGTH]
+        if len(msgs) > self.max_history_window:
+            system_prompts = [m for m in msgs if m.get("role") == "system"]
+            recent_messages = msgs[-self.max_history_window:]
+            # avoid duplicates between system_prompts and recent_messages
+            combined = system_prompts + [m for m in recent_messages if m not in system_prompts]
+            return combined
+        return msgs
 
 
 # ==========================================
-# 3. Session & Lifecycle Manager
+# 3. 具備 Async Lock 的線程安全 Session 管理器
 # ==========================================
+class SessionEntry:
+    def __init__(self):
+        self.pid = AdaptivePIDController()
+        self.lock = asyncio.Lock()
+        self.last_accessed = time.time()
+
 class SessionManager:
-    """Manages multi-session isolation with automatic TTL cleanup to prevent memory leaks."""
+    """管理多用戶隔離實例，並透過 asyncio.Lock 確保高併發線程安全。"""
     def __init__(self, ttl: int = 3600):
-        self.pids: Dict[str, AdaptivePIDController] = {}
+        self.sessions: Dict[str, SessionEntry] = {}
         self.memory_layer = MemoryLayer()
         self.ttl = ttl
+        self._sessions_lock = asyncio.Lock()
 
-    def get_pid(self, session_id: str) -> AdaptivePIDController:
+    async def get_or_create_session(self, session_id: str) -> SessionEntry:
         now = time.time()
-        expired_sessions = [sid for sid, p in self.pids.items() if now - p.last_accessed > self.ttl]
-        for sid in expired_sessions:
-            if sid in self.pids:
-                del self.pids[sid]
-            logger.info(f"[Session Manager] Purged expired session: {sid}")
+        # 清理逾期 Session (best-effort)
+        expired = [sid for sid, entry in list(self.sessions.items()) if now - entry.last_accessed > self.ttl]
+        for sid in expired:
+            self.sessions.pop(sid, None)
 
-        if session_id not in self.pids:
-            self.pids[session_id] = AdaptivePIDController()
-            logger.info(f"[Session Manager] Initialized new Adaptive PID for session: {session_id}")
-            
-        return self.pids[session_id]
+        # protect creation with a lock to avoid race conditions
+        async with self._sessions_lock:
+            if session_id not in self.sessions:
+                self.sessions[session_id] = SessionEntry()
+                logger.info(f"[Session Manager] Initialized session: {session_id}")
+            entry = self.sessions[session_id]
+            entry.last_accessed = now
+            return entry
 
 session_manager = SessionManager(ttl=SESSION_TTL_SECONDS)
 
 
 # ==========================================
-# 4. Auto-Anchor & Drift Monitor Engine
+# 4. 連續型穩態負載與漂移監控引擎
 # ==========================================
 class AnchorMonitor:
-    """Automatically extracts system or user prompts as baseline anchors and computes drift scores."""
     @staticmethod
     def extract_anchor(messages: List[Dict[str, str]]) -> str:
         for msg in messages:
@@ -164,56 +181,82 @@ class AnchorMonitor:
             return 0.0
         anchor_words = set(anchor.lower().split())
         current_words = set(current_text.lower().split())
-        
         if not anchor_words:
             return 0.0
-        
         intersection = anchor_words.intersection(current_words)
         union = anchor_words.union(current_words)
-        jaccard_similarity = len(intersection) / len(union) if union else 1.0
-        
-        return 1.0 - jaccard_similarity
+        return 1.0 - (len(intersection) / len(union) if union else 1.0)
 
 def calculate_ngram_repetition(text: str, n: int = 3) -> float:
-    """Calculates N-gram repetition ratio to detect repetitive loops."""
     words = text.split()
     if len(words) < n:
         return 0.0
     ngrams = [tuple(words[i:i+n]) for i in range(len(words)-n+1)]
-    unique_ngrams = set(ngrams)
-    return 1.0 - (len(unique_ngrams) / len(ngrams))
+    return 1.0 - (len(set(ngrams)) / len(ngrams))
 
-def evaluate_homeostatic_load(messages: List[Dict[str, str]]) -> float:
-    """Evaluates homeostatic load combining N-gram repetition and topic drift."""
+def evaluate_continuous_homeostatic_load(messages: List[Dict[str, str]]) -> float:
+    """計算連續型穩態負載指標，讓 PID 獲得平滑的誤差變化量。"""
     if not messages:
         return 2.5
-        
     last_content = messages[-1].get("content", "")
     ngram_rep = calculate_ngram_repetition(last_content, n=3)
-    
     anchor = AnchorMonitor.extract_anchor(messages)
     drift_score = AnchorMonitor.calculate_drift(anchor, last_content)
     
-    logger.debug(f"[Monitor] Drift Score: {drift_score:.4f} | N-gram Rep: {ngram_rep:.4f}")
-    
-    if ngram_rep > 0.4 or drift_score > 0.85:
-        return 0.2  # Trigger thermal adjustment
-        
-    return 2.5      # Normal equilibrium
+    # 透過加權組合計算連續性負載分數 (0.1 ~ 5.0)
+    load = 2.5 - (ngram_rep * 1.5 + drift_score * 1.0)
+    return max(0.1, min(5.0, load))
 
 
 # ==========================================
-# 5. FastAPI Proxy & Health Check Endpoints
+# 5. FastAPI 安全代理與健康檢查端點
 # ==========================================
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
-    """Liveness probe endpoint for container orchestrators (Docker / K8s)."""
     return {
         "status": "healthy",
-        "version": "2.0.0",
-        "architecture": "Cognitive-Homeostatic Engine",
-        "active_sessions": len(session_manager.pids)
+        "version": "2.3.0",
+        "active_sessions": len(session_manager.sessions)
     }
+
+
+def _sanitize_and_limit_messages(raw_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    msgs = list(raw_messages or [])
+    if len(msgs) > MAX_MESSAGES:
+        logger.warning(f"Trimming messages from {len(msgs)} to MAX_MESSAGES={MAX_MESSAGES}")
+        msgs = msgs[-MAX_MESSAGES:]
+    # truncate long content fields
+    sanitized = []
+    for m in msgs:
+        mm = dict(m)
+        if isinstance(mm.get("content"), str) and len(mm["content"]) > MAX_MESSAGE_LENGTH:
+            mm["content"] = mm["content"][:MAX_MESSAGE_LENGTH]
+        sanitized.append(mm)
+    return sanitized
+
+
+async def _send_with_retries(client: httpx.AsyncClient, req: httpx.Request) -> httpx.Response:
+    last_exc = None
+    for attempt in range(1, UPSTREAM_RETRIES + 2):
+        try:
+            response = await client.send(req, stream=True)
+            # treat 5xx as retriable
+            if response.status_code >= 500 and attempt <= UPSTREAM_RETRIES:
+                await response.aclose()
+                backoff = 0.5 * (2 ** (attempt - 1))
+                logger.warning(f"Upstream 5xx, retrying in {backoff}s (attempt {attempt})")
+                await asyncio.sleep(backoff)
+                continue
+            return response
+        except (httpx.RequestError, httpx.TransportError) as e:
+            last_exc = e
+            backoff = 0.5 * (2 ** (attempt - 1))
+            logger.warning(f"Upstream request error: {e}; retrying in {backoff}s (attempt {attempt})")
+            await asyncio.sleep(backoff)
+            continue
+    # if we get here, all retries exhausted
+    raise last_exc if last_exc is not None else RuntimeError("Upstream retries exhausted")
+
 
 @app.post("/v1/chat/completions", tags=["Proxy"])
 async def proxy_chat_completions(request: Request):
@@ -224,39 +267,63 @@ async def proxy_chat_completions(request: Request):
     
     session_id = request.headers.get("x-session-id", request.client.host if request.client else "default-session")
     
+    # 取得安全隔離的 Session 實例與鎖
+    session_entry = await session_manager.get_or_create_session(session_id)
+
+    # sanitize and limit messages early
     raw_messages = body.get("messages", [])
-    optimized_messages = session_manager.memory_layer.process_and_compress(session_id, raw_messages)
+    raw_messages = _sanitize_and_limit_messages(raw_messages)
+    optimized_messages = session_manager.memory_layer.process_and_compress(raw_messages)
     body["messages"] = optimized_messages
-    
-    homeo_load = evaluate_homeostatic_load(optimized_messages)
-    pid = session_manager.get_pid(session_id)
-    
-    base_temp = body.get("temperature", 0.7)
-    delta_t = pid.compute(homeo_load)
-    adjusted_temp = max(0.1, min(2.0, base_temp + delta_t))
-    body["temperature"] = adjusted_temp
-    
-    logger.info(f"Session: {session_id} | ML-PID Kp: {pid.kp:.4f} | Temp: {base_temp} -> {adjusted_temp:.4f}")
-    
-    client = httpx.AsyncClient(timeout=60.0)
-    try:
-        req = client.build_request("POST", BACKEND_URL, json=body, headers=dict(request.headers))
-        response = await client.send(req, stream=True)
-    except httpx.RequestError as e:
-        logger.error(f"Failed to connect to upstream LLM backend at {BACKEND_URL}: {e}")
-        return JSONResponse({
-            "error": {
-                "message": f"Cognitive Middleware Error: Upstream backend unreachable at {BACKEND_URL}.",
-                "type": "server_error",
-                "code": 503
-            }
-        }, status_code=503)
-    
-    return StreamingResponse(
-        response.aiter_raw(),
-        status_code=response.status_code,
-        headers=dict(response.headers)
-    )
+
+    # compute homeostatic load and adjust temperature under session lock
+    async with session_entry.lock:
+        homeo_load = evaluate_continuous_homeostatic_load(optimized_messages)
+        delta_t = session_entry.pid.compute(homeo_load)
+        base_temp = body.get("temperature", 0.7)
+        adjusted_temp = max(0.1, min(2.0, base_temp + delta_t))
+        body["temperature"] = adjusted_temp
+        session_entry.last_accessed = time.time()
+
+    logger.info(f"Session: {session_id} | Load: {homeo_load:.2f} | Temp: {base_temp} -> {adjusted_temp:.4f}")
+
+    # 過濾並白名單傳入標頭
+    forward_headers = {}
+    for k, v in request.headers.items():
+        kl = k.lower()
+        if kl in FORWARD_HEADER_WHITELIST and kl not in HOP_BY_HOP_HEADERS:
+            forward_headers[k] = v
+
+    # build request and send with async client using context manager and retry
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+        req = client.build_request("POST", BACKEND_URL, json=body, headers=forward_headers)
+        try:
+            response = await _send_with_retries(client, req)
+        except Exception as e:
+            logger.error(f"Upstream unreachable at {BACKEND_URL}: {e}")
+            return JSONResponse({
+                "error": {
+                    "message": f"Middleware Error: Upstream backend unreachable.",
+                    "type": "server_error",
+                    "code": 503
+                }
+            }, status_code=503)
+
+        # 安全串流回傳並確保資源正確釋放
+        async def stream_and_close():
+            try:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+            finally:
+                await response.aclose()
+
+        resp_headers = {k: v for k, v in response.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
+
+        return StreamingResponse(
+            stream_and_close(),
+            status_code=response.status_code,
+            headers=resp_headers
+        )
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
